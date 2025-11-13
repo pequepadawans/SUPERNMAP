@@ -1,0 +1,132 @@
+#!/bin/bash
+
+# --- 0. Color Definitions ---
+GREEN="\033[0;32m"
+YELLOW="\033[0;33m"
+RED="\033[0;31m"
+NC="\033[0m" # No Color
+
+# --- 1. Help Function ---
+show_help() {
+    echo -e "${GREEN}Usage:${NC} $0 <ip_address> [options]"
+    echo -e "\n${YELLOW}Description:${NC}"
+    echo -e "  Runs a 2 or 3-phased Nmap scan against a target IP."
+    echo -e "\n${YELLOW}Options:${NC}"
+    echo -e "  -h, --help        Show this help message."
+    echo -e "  --udp-top         Run a UDP scan on the Top 100 ports (after TCP)."
+    echo -e "  --udp-full        Run a full UDP scan (after TCP)."
+    echo -e "  --timing <0-5>    Set Nmap timing template (0=paranoid, 5=insane)."
+    echo -e "                    Default is aggressive (-T4 --min-rate 1000)."
+    echo -e "\n${YELLOW}Example:${NC}"
+    echo -e "  $0 10.10.11.100 --udp-top"
+    echo -e "  $0 10.10.11.100 --timing 2 --udp-top"
+}
+
+# --- 2. Argument Parsing ---
+target_ip=""
+udp_option=""
+timing_arg="-T4"
+phase1_rate_flag="--min-rate 1000"
+
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --udp-top)
+            udp_option="--udp-top"
+            shift
+            ;;
+        --udp-full)
+            udp_option="--udp-full"
+            shift
+            ;;
+        --timing)
+            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
+                timing_arg="-T$2"
+                phase1_rate_flag="" 
+                shift
+                shift
+            else
+                echo -e "${RED}[!] Error: --timing option requires a value (0-5).${NC}"
+                exit 1
+            fi
+            ;;
+        *)
+            if [ -z "$target_ip" ]; then
+                target_ip="$1"
+                shift
+            else
+                echo -e "${RED}[!] Unknown or misplaced argument: $1${NC}"
+                shift
+            fi
+            ;;
+    esac
+done
+
+# --- 3. IP and Name Verification ---
+if [ -z "$target_ip" ]; then
+    echo -e "${RED}[!] Error: No IP address provided.${NC}"
+    show_help
+    exit 1
+fi
+
+echo -e -n "${YELLOW}Enter a base name for the files (e.g., 'WebServer'): ${NC}"
+read base_name
+
+if [ -z "$base_name" ]; then
+    echo -e "${RED}[!] Error: You must provide a base name.${NC}"
+    exit 1
+fi
+
+file_ports="ports_${base_name}.nmap"
+file_info="info_${base_name}.nmap"
+file_udp="UDP_${base_name}.nmap"
+
+echo -e "------------------------------------------------"
+echo -e "${YELLOW}[*] Starting scan for: $target_ip${NC}"
+echo -e "${YELLOW}[*] Timing Template: $timing_arg $phase1_rate_flag${NC}"
+echo -e "${YELLOW}[*] Files will be saved as: *_${base_name}.nmap${NC}"
+echo -e "------------------------------------------------"
+
+# --- 4. PHASE 1: FAST PORT SCAN (TCP) ---
+echo -e "${YELLOW}[*] PHASE 1 (TCP): Starting fast port scan...${NC}"
+nmap -Pn -p- $timing_arg $phase1_rate_flag $target_ip -oN $file_ports 2>/dev/null
+echo -e "${GREEN}[+] PHASE 1 (TCP): Complete. Output saved to $file_ports${NC}"
+
+# --- 5. PHASE 2: EXHAUSTIVE SCAN (TCP) ---
+echo -e "${YELLOW}[*] Processing open ports for Phase 2...${NC}"
+ports=$(grep '^[0-9].*/tcp *open' $file_ports | cut -d'/' -f1 | tr '\n' ',' | sed 's/,$//')
+
+if [ -z "$ports" ]; then
+    echo -e "${RED}[!] PHASE 2 (TCP): No open TCP ports found. Skipping...${NC}"
+else
+    echo -e "${YELLOW}[*] PHASE 2 (TCP): Starting exhaustive scan on ports: $ports${NC}"
+    nmap -Pn -p $ports $timing_arg -sV -sC $target_ip -oN $file_info
+    echo -e "${GREEN}[+] PHASE 2 (TCP): Complete. Output saved to $file_info${NC}"
+fi
+
+# --- 6. PHASE 3: UDP SCAN (OPTIONAL) ---
+echo -e "------------------------------------------------"
+case "$udp_option" in
+    --udp-top)
+        echo -e "${YELLOW}[*] PHASE 3 (UDP): Starting UDP scan on Top 100 ports...${NC}"
+        echo -e "${YELLOW}[!] (Sudo required)${NC}"
+        sudo nmap -Pn $timing_arg -sU --top-ports 100 $target_ip -oN $file_udp
+        echo -e "${GREEN}[+] PHASE 3 (UDP): Complete. Output saved to $file_udp${NC}"
+        ;;
+    --udp-full)
+        echo -e "${YELLOW}[*] PHASE 3 (UDP): Starting FULL UDP scan (-p-)...${NC}"
+        echo -e "${RED}[!] (This can take a VERY long time. Sudo required)${NC}"
+        sudo nmap -Pn $timing_arg -sU -p- $target_ip -oN $file_udp
+        echo -e "${GREEN}[+] PHASE 3 (UDP): Complete. Output saved to $file_udp${NC}"
+        ;;
+    *)
+        echo -e "${YELLOW}[*] PHASE 3 (UDP): Skipping UDP scan.${NC}"
+        ;;
+esac
+
+echo -e "------------------------------------------------"
+echo -e "${GREEN}[✔] All scans have finished.${NC}"
