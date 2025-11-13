@@ -1,7 +1,3 @@
-Here is the polished, English version of your `README.md`.
-
------
-
 # SUPERNMAP
 
 `supernmap` is a simple Bash script that automates and optimizes your typical Nmap scanning workflow.
