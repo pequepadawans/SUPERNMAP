@@ -4,6 +4,8 @@
 GREEN="\033[0;32m"
 YELLOW="\033[0;33m"
 RED="\033[0;31m"
+CYAN="\033[0;36m"
+MAGENTA="\033[0;35m"
 NC="\033[0m" # No Color
 
 # --- 1. Help Function ---
@@ -12,21 +14,55 @@ show_help() {
     echo -e "\n${YELLOW}Description:${NC}"
     echo -e "  Runs a 2 or 3-phased Nmap scan against a target IP."
     echo -e "\n${YELLOW}Options:${NC}"
-    echo -e "  -h, --help        Show this help message."
-    echo -e "  --udp-top         Run a UDP scan on the Top 100 ports (after TCP)."
-    echo -e "  --udp-full        Run a full UDP scan (after TCP)."
-    echo -e "  --timing <0-5>    Set Nmap timing template (0=paranoid, 5=insane)."
-    echo -e "                    Default is aggressive (-T4 --min-rate 1000)."
+    echo -e "  -h, --help              Show this help message."
+    echo -e "  --udp-top               Run a UDP scan on the Top 100 ports (after TCP)."
+    echo -e "  --udp-full              Run a full UDP scan (after TCP)."
+    echo -e "  --udp-bg                Run the UDP scan in the background (parallel to other output)."
+    echo -e "                          Default is sequential. Use with --udp-top or --udp-full."
+    echo -e "  --timing <0-5>          Set Nmap timing template (0=paranoid, 5=insane)."
+    echo -e "                          Default is aggressive (-T4 --min-rate 1000)."
+    echo -e "\n${CYAN}  --- Output ---${NC}"
+    echo -e "  --html                  Save scans as XML and convert to HTML (requires xsltproc)."
+    echo -e "  --serve [port]          Start a python3 HTTP server to view the HTML report."
+    echo -e "                          Default port: 8080. Implies --html."
+    echo -e "\n${CYAN}  --- Evasion ---${NC}"
+    echo -e "  --ack                   Use ACK scan (-sA) in Phase 1 to evade stateless firewalls."
+    echo -e "  --frag                  Fragment packets at 8 bytes (-f) to evade stateless firewalls."
+    echo -e "  --frag-double           Fragment packets at 16 bytes (-ff)."
+    echo -e "  --mtu <N>               Custom MTU (must be a multiple of 8)."
+    echo -e "  --decoy <N>             Add N random decoy IPs (-D RND:N)."
+    echo -e "  --source-port <N>       Spoof source port (e.g. 53 to bypass firewall rules)."
+    echo -e "  --dns-server <IP>       Use a custom DNS server (useful in DMZ environments)."
+    echo -e "\n${CYAN}  --- NSE Scripts ---${NC}"
+    echo -e "  --script <name,...>     Run specific NSE script(s) in Phase 2."
+    echo -e "  --script-cat <category> Run all NSE scripts from a category in Phase 2."
+    echo -e "                          Categories: auth, broadcast, brute, default, discovery,"
+    echo -e "                          dos, exploit, external, fuzzer, intrusive, malware,"
+    echo -e "                          safe, version, vuln"
     echo -e "\n${YELLOW}Example:${NC}"
     echo -e "  $0 10.10.11.100 --udp-top"
     echo -e "  $0 10.10.11.100 --timing 2 --udp-top"
+    echo -e "  $0 10.10.11.100 --html --serve 8080"
+    echo -e "  $0 10.10.11.100 --frag --decoy 5 --source-port 53"
+    echo -e "  $0 10.10.11.100 --script-cat vuln"
 }
 
 # --- 2. Argument Parsing ---
 target_ip=""
 udp_option=""
+udp_bg=0
 timing_arg="-T4"
 phase1_rate_flag="--min-rate 1000"
+
+# NEW: evasion / output flags
+html_output=0
+serve_http=0
+serve_port=8080
+evasion_flags=""
+nse_scripts=""
+source_port_flag=""
+dns_server_flag=""
+ack_scan=0
 
 while [[ $# -gt 0 ]]; do
     key="$1"
@@ -43,14 +79,103 @@ while [[ $# -gt 0 ]]; do
             udp_option="--udp-full"
             shift
             ;;
+        --udp-bg)
+            udp_bg=1
+            shift
+            ;;
         --timing)
             if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
                 timing_arg="-T$2"
-                phase1_rate_flag="" 
-                shift
-                shift
+                phase1_rate_flag=""
+                shift 2
             else
                 echo -e "${RED}[!] Error: --timing option requires a value (0-5).${NC}"
+                exit 1
+            fi
+            ;;
+        # ── Output ──────────────────────────────────────────────
+        --html)
+            html_output=1
+            shift
+            ;;
+        --serve)
+            html_output=1
+            serve_http=1
+            if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                serve_port="$2"
+                shift
+            fi
+            shift
+            ;;
+        # ── Evasión ─────────────────────────────────────────────
+        --ack)
+            ack_scan=1
+            shift
+            ;;
+        --frag)
+            evasion_flags="$evasion_flags -f"
+            shift
+            ;;
+        --frag-double)
+            evasion_flags="$evasion_flags -ff"
+            shift
+            ;;
+        --mtu)
+            if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                if (( $2 % 8 != 0 )); then
+                    echo -e "${RED}[!] Error: --mtu value must be a multiple of 8.${NC}"
+                    exit 1
+                fi
+                evasion_flags="$evasion_flags --mtu $2"
+                shift 2
+            else
+                echo -e "${RED}[!] Error: --mtu requires a numeric value.${NC}"
+                exit 1
+            fi
+            ;;
+        --decoy)
+            if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                evasion_flags="$evasion_flags -D RND:$2"
+                shift 2
+            else
+                echo -e "${RED}[!] Error: --decoy requires a numeric value (number of decoys).${NC}"
+                exit 1
+            fi
+            ;;
+        --source-port)
+            if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                source_port_flag="--source-port $2"
+                shift 2
+            else
+                echo -e "${RED}[!] Error: --source-port requires a numeric port value.${NC}"
+                exit 1
+            fi
+            ;;
+        --dns-server)
+            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
+                dns_server_flag="--dns-server $2"
+                shift 2
+            else
+                echo -e "${RED}[!] Error: --dns-server requires an IP address.${NC}"
+                exit 1
+            fi
+            ;;
+        # ── NSE Scripts ─────────────────────────────────────────
+        --script)
+            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
+                nse_scripts="--script $2"
+                shift 2
+            else
+                echo -e "${RED}[!] Error: --script requires a script name or comma-separated list.${NC}"
+                exit 1
+            fi
+            ;;
+        --script-cat)
+            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
+                nse_scripts="--script $2"
+                shift 2
+            else
+                echo -e "${RED}[!] Error: --script-cat requires a category name.${NC}"
                 exit 1
             fi
             ;;
@@ -85,16 +210,68 @@ file_ports="ports_${base_name}.nmap"
 file_info="info_${base_name}.nmap"
 file_udp="UDP_${base_name}.nmap"
 
+# NEW: XML/HTML file names
+file_ports_xml="ports_${base_name}.xml"
+file_info_xml="info_${base_name}.xml"
+file_ports_html="ports_${base_name}.html"
+file_info_html="info_${base_name}.html"
+
+# NEW: build output flag string (adds -oX alongside -oN when --html is set)
+build_output_flags() {
+    local base_file="$1"
+    local xml_file="$2"
+    if [[ $html_output -eq 1 ]]; then
+        echo "-oN ${base_file} -oX ${xml_file}"
+    else
+        echo "-oN ${base_file}"
+    fi
+}
+
+# NEW: convert XML to HTML using xsltproc
+convert_to_html() {
+    local xml_file="$1"
+    local html_file="$2"
+    if [[ -f "$xml_file" ]]; then
+        echo -e "${CYAN}[*] Converting $xml_file → $html_file ...${NC}"
+        if xsltproc "$xml_file" -o "$html_file" 2>/dev/null; then
+            echo -e "${GREEN}[✔] HTML report: $(pwd)/${html_file}${NC}"
+        else
+            echo -e "${RED}[!] xsltproc failed. Is it installed? (apt install xsltproc)${NC}"
+        fi
+    fi
+}
+
 echo -e "------------------------------------------------"
 echo -e "${YELLOW}[*] Starting scan for: $target_ip${NC}"
 echo -e "${YELLOW}[*] Timing Template: $timing_arg $phase1_rate_flag${NC}"
 echo -e "${YELLOW}[*] Files will be saved as: *_${base_name}.nmap${NC}"
+
+# NEW: print active evasion/extra options
+[[ -n "$evasion_flags" ]]   && echo -e "${MAGENTA}[*] Evasion flags: $evasion_flags${NC}"
+[[ -n "$source_port_flag" ]] && echo -e "${MAGENTA}[*] Source port: $source_port_flag${NC}"
+[[ -n "$dns_server_flag" ]]  && echo -e "${MAGENTA}[*] DNS server: $dns_server_flag${NC}"
+[[ -n "$nse_scripts" ]]      && echo -e "${CYAN}[*] NSE scripts: $nse_scripts${NC}"
+[[ $ack_scan -eq 1 ]]        && echo -e "${MAGENTA}[*] ACK scan mode enabled (-sA)${NC}"
+[[ $html_output -eq 1 ]]     && echo -e "${CYAN}[*] HTML output enabled${NC}"
 echo -e "------------------------------------------------"
 
 # --- 4. PHASE 1: FAST PORT SCAN (TCP) ---
 echo -e "${YELLOW}[*] PHASE 1 (TCP): Starting fast port scan...${NC}"
-nmap -Pn -p- $timing_arg $phase1_rate_flag $target_ip -oN $file_ports 2>/dev/null
+
+# NEW: choose scan type (-sS default, -sA if --ack)
+phase1_scan_type="-sS"
+[[ $ack_scan -eq 1 ]] && phase1_scan_type="-sA"
+
+phase1_out=$(build_output_flags "$file_ports" "$file_ports_xml")
+
+nmap $phase1_scan_type -Pn -p- $timing_arg $phase1_rate_flag \
+     $evasion_flags $source_port_flag $dns_server_flag \
+     $target_ip $phase1_out 2>/dev/null
+
 echo -e "${GREEN}[+] PHASE 1 (TCP): Complete. Output saved to $file_ports${NC}"
+
+# NEW: convert Phase 1 to HTML
+[[ $html_output -eq 1 ]] && convert_to_html "$file_ports_xml" "$file_ports_html"
 
 # --- 5. PHASE 2: EXHAUSTIVE SCAN (TCP) ---
 echo -e "${YELLOW}[*] Processing open ports for Phase 2...${NC}"
@@ -104,24 +281,60 @@ if [ -z "$ports" ]; then
     echo -e "${RED}[!] PHASE 2 (TCP): No open TCP ports found. Skipping...${NC}"
 else
     echo -e "${YELLOW}[*] PHASE 2 (TCP): Starting exhaustive scan on ports: $ports${NC}"
-    nmap -Pn -p $ports $timing_arg -sV -sC $target_ip -oN $file_info
+
+    phase2_out=$(build_output_flags "$file_info" "$file_info_xml")
+
+    nmap -Pn -p $ports $timing_arg -sV -sS -sC \
+         $nse_scripts $source_port_flag $dns_server_flag \
+         $target_ip $phase2_out
+
     echo -e "${GREEN}[+] PHASE 2 (TCP): Complete. Output saved to $file_info${NC}"
+
+    # NEW: convert Phase 2 to HTML
+    [[ $html_output -eq 1 ]] && convert_to_html "$file_info_xml" "$file_info_html"
 fi
 
 # --- 6. PHASE 3: UDP SCAN (OPTIONAL) ---
 echo -e "------------------------------------------------"
+file_udp_xml="UDP_${base_name}.xml"
+file_udp_html="UDP_${base_name}.html"
+udp_log="UDP_${base_name}.log"
+udp_pid=""
+
+# Helper: run UDP nmap command, in bg or fg depending on $udp_bg
+run_udp_scan() {
+    local nmap_cmd="$1"
+    if [[ $udp_bg -eq 1 ]]; then
+        echo -e "${CYAN}[*] PHASE 3 (UDP): Running in BACKGROUND...${NC}"
+        echo -e "${CYAN}[*] Log file: ${udp_log}${NC}"
+        eval "$nmap_cmd" > "$udp_log" 2>&1 &
+        udp_pid=$!
+        echo -e "${GREEN}[+] PHASE 3 (UDP): Launched in background (PID: ${udp_pid}).${NC}"
+        echo -e "${YELLOW}    Monitor with: tail -f ${udp_log}${NC}"
+        echo -e "${YELLOW}    Wait manually: wait ${udp_pid}${NC}"
+    else
+        eval "$nmap_cmd"
+        echo -e "${GREEN}[+] PHASE 3 (UDP): Complete. Output saved to $file_udp${NC}"
+        [[ $html_output -eq 1 ]] && convert_to_html "$file_udp_xml" "$file_udp_html"
+    fi
+}
+
 case "$udp_option" in
     --udp-top)
         echo -e "${YELLOW}[*] PHASE 3 (UDP): Starting UDP scan on Top 100 ports...${NC}"
         echo -e "${YELLOW}[!] (Sudo required)${NC}"
-        sudo nmap -Pn $timing_arg -sU --top-ports 100 $target_ip -oN $file_udp
-        echo -e "${GREEN}[+] PHASE 3 (UDP): Complete. Output saved to $file_udp${NC}"
+        udp_out=$(build_output_flags "$file_udp" "$file_udp_xml")
+        run_udp_scan "sudo nmap -Pn $timing_arg -sU --top-ports 100 \
+             $source_port_flag $dns_server_flag \
+             $target_ip $udp_out"
         ;;
     --udp-full)
         echo -e "${YELLOW}[*] PHASE 3 (UDP): Starting FULL UDP scan (-p-)...${NC}"
         echo -e "${RED}[!] (This can take a VERY long time. Sudo required)${NC}"
-        sudo nmap -Pn $timing_arg -sU -p- $target_ip -oN $file_udp
-        echo -e "${GREEN}[+] PHASE 3 (UDP): Complete. Output saved to $file_udp${NC}"
+        udp_out=$(build_output_flags "$file_udp" "$file_udp_xml")
+        run_udp_scan "sudo nmap -Pn $timing_arg -sU -p- \
+             $source_port_flag $dns_server_flag \
+             $target_ip $udp_out"
         ;;
     *)
         echo -e "${YELLOW}[*] PHASE 3 (UDP): Skipping UDP scan.${NC}"
@@ -129,4 +342,37 @@ case "$udp_option" in
 esac
 
 echo -e "------------------------------------------------"
-echo -e "${GREEN}[✔] All scans have finished.${NC}"
+echo -e "${GREEN}[✔] TCP scans have finished.${NC}"
+
+# Wait for background UDP scan if it was launched
+if [[ -n "$udp_pid" ]]; then
+    echo -e "\n${CYAN}[*] Background UDP scan still running (PID: ${udp_pid}).${NC}"
+    echo -e -n "${YELLOW}    Wait for it to finish before exiting? [Y/n]: ${NC}"
+    read -r wait_resp
+    wait_resp="${wait_resp:-Y}"
+    if [[ "$wait_resp" =~ ^[Yy]$ ]]; then
+        echo -e "${CYAN}[*] Waiting for UDP scan (PID: ${udp_pid})...${NC}"
+        wait "$udp_pid"
+        echo -e "${GREEN}[+] PHASE 3 (UDP): Complete. Output saved to $file_udp${NC}"
+        [[ $html_output -eq 1 ]] && convert_to_html "$file_udp_xml" "$file_udp_html"
+    else
+        echo -e "${YELLOW}[*] Leaving UDP scan running in background. PID: ${udp_pid}${NC}"
+        echo -e "${YELLOW}    Monitor: tail -f ${udp_log}${NC}"
+    fi
+fi
+
+# NEW: summary of HTML reports & optional HTTP server
+if [[ $html_output -eq 1 ]]; then
+    echo -e "\n${CYAN}[*] HTML reports generated:${NC}"
+    for f in ports_${base_name}.html info_${base_name}.html UDP_${base_name}.html; do
+        [[ -f "$f" ]] && echo -e "    ${GREEN}→ $(pwd)/$f${NC}"
+    done
+
+    if [[ $serve_http -eq 1 ]]; then
+        echo -e "\n${CYAN}[*] Starting HTTP server on port ${serve_port}...${NC}"
+        echo -e "${YELLOW}    Open in your browser: http://127.0.0.1:${serve_port}/${NC}"
+        echo -e "${YELLOW}    e.g. http://127.0.0.1:${serve_port}/info_${base_name}.html${NC}"
+        echo -e "\033[2m    (Ctrl+C to stop the server)\033[0m"
+        python3 -m http.server "$serve_port"
+    fi
+fi
