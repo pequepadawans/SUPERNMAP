@@ -21,6 +21,8 @@
 ```bash
 python3 supernmap.py <ip1> [ip2 ...] [options]
 ```
+<img width="1545" height="940" alt="imagen" src="https://github.com/user-attachments/assets/21e65478-a7a6-4d94-ad3f-67e539fa8f3f" />
+
 
 ### Options
 
