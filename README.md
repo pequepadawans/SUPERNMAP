@@ -1,4 +1,4 @@
-# SuperNmap
+# SuperNmap.py
 
 **SuperNmap** is an advanced, highly-concurrent wrapper for `nmap` designed to optimize and automate network enumeration. It performs intelligent, multi-phased scanning to get results as fast as possible while maintaining a clean, noise-free terminal interface.
 
