@@ -1,378 +1,717 @@
-#!/bin/bash
+#!/usr/bin/env python3
+"""
+supernmap - Advanced Nmap wrapper for structured scanning.
+"""
 
-# --- 0. Color Definitions ---
-GREEN="\033[0;32m"
-YELLOW="\033[0;33m"
-RED="\033[0;31m"
-CYAN="\033[0;36m"
-MAGENTA="\033[0;35m"
-NC="\033[0m" # No Color
+import argparse
+import os
+import re
+import signal
+import subprocess
+import sys
+import termios
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
-# --- 1. Help Function ---
-show_help() {
-    echo -e "${GREEN}Usage:${NC} $0 <ip_address> [options]"
-    echo -e "\n${YELLOW}Description:${NC}"
-    echo -e "  Runs a 2 or 3-phased Nmap scan against a target IP."
-    echo -e "\n${YELLOW}Options:${NC}"
-    echo -e "  -h, --help              Show this help message."
-    echo -e "  --udp-top               Run a UDP scan on the Top 100 ports (after TCP)."
-    echo -e "  --udp-full              Run a full UDP scan (after TCP)."
-    echo -e "  --udp-bg                Run the UDP scan in the background (parallel to other output)."
-    echo -e "                          Default is sequential. Use with --udp-top or --udp-full."
-    echo -e "  --timing <0-5>          Set Nmap timing template (0=paranoid, 5=insane)."
-    echo -e "                          Default is aggressive (-T4 --min-rate 1000)."
-    echo -e "\n${CYAN}  --- Output ---${NC}"
-    echo -e "  --html                  Save scans as XML and convert to HTML (requires xsltproc)."
-    echo -e "  --serve [port]          Start a python3 HTTP server to view the HTML report."
-    echo -e "                          Default port: 8080. Implies --html."
-    echo -e "\n${CYAN}  --- Evasion ---${NC}"
-    echo -e "  --ack                   Use ACK scan (-sA) in Phase 1 to evade stateless firewalls."
-    echo -e "  --frag                  Fragment packets at 8 bytes (-f) to evade stateless firewalls."
-    echo -e "  --frag-double           Fragment packets at 16 bytes (-ff)."
-    echo -e "  --mtu <N>               Custom MTU (must be a multiple of 8)."
-    echo -e "  --decoy <N>             Add N random decoy IPs (-D RND:N)."
-    echo -e "  --source-port <N>       Spoof source port (e.g. 53 to bypass firewall rules)."
-    echo -e "  --dns-server <IP>       Use a custom DNS server (useful in DMZ environments)."
-    echo -e "\n${CYAN}  --- NSE Scripts ---${NC}"
-    echo -e "  --script <name,...>     Run specific NSE script(s) in Phase 2."
-    echo -e "  --script-cat <category> Run all NSE scripts from a category in Phase 2."
-    echo -e "                          Categories: auth, broadcast, brute, default, discovery,"
-    echo -e "                          dos, exploit, external, fuzzer, intrusive, malware,"
-    echo -e "                          safe, version, vuln"
-    echo -e "\n${YELLOW}Example:${NC}"
-    echo -e "  $0 10.10.11.100 --udp-top"
-    echo -e "  $0 10.10.11.100 --timing 2 --udp-top"
-    echo -e "  $0 10.10.11.100 --html --serve 8080"
-    echo -e "  $0 10.10.11.100 --frag --decoy 5 --source-port 53"
-    echo -e "  $0 10.10.11.100 --script-cat vuln"
-}
+# ── ANSI Colors ──────────────────────────────────────────────────────────────
+G  = "\033[0;32m"
+Y  = "\033[0;33m"
+R  = "\033[0;31m"
+C  = "\033[0;36m"
+M  = "\033[0;35m"
+NC = "\033[0m"
+DIM= "\033[2m"
 
-# --- 2. Argument Parsing ---
-target_ip=""
-udp_option=""
-udp_bg=0
-timing_arg="-T4"
-phase1_rate_flag="--min-rate 1000"
+def p(color, msg):
+    print(f"{color}{msg}{NC}", flush=True)
 
-# NEW: evasion / output flags
-html_output=0
-serve_http=0
-serve_port=8080
-evasion_flags=""
-nse_scripts=""
-source_port_flag=""
-dns_server_flag=""
-ack_scan=0
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-while [[ $# -gt 0 ]]; do
-    key="$1"
-    case $key in
-        -h|--help)
-            show_help
-            exit 0
-            ;;
-        --udp-top)
-            udp_option="--udp-top"
-            shift
-            ;;
-        --udp-full)
-            udp_option="--udp-full"
-            shift
-            ;;
-        --udp-bg)
-            udp_bg=1
-            shift
-            ;;
-        --timing)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                timing_arg="-T$2"
-                phase1_rate_flag=""
-                shift 2
-            else
-                echo -e "${RED}[!] Error: --timing option requires a value (0-5).${NC}"
-                exit 1
-            fi
-            ;;
-        # ── Output ──────────────────────────────────────────────
-        --html)
-            html_output=1
-            shift
-            ;;
-        --serve)
-            html_output=1
-            serve_http=1
-            if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
-                serve_port="$2"
-                shift
-            fi
-            shift
-            ;;
-        # ── Evasión ─────────────────────────────────────────────
-        --ack)
-            ack_scan=1
-            shift
-            ;;
-        --frag)
-            evasion_flags="$evasion_flags -f"
-            shift
-            ;;
-        --frag-double)
-            evasion_flags="$evasion_flags -ff"
-            shift
-            ;;
-        --mtu)
-            if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
-                if (( $2 % 8 != 0 )); then
-                    echo -e "${RED}[!] Error: --mtu value must be a multiple of 8.${NC}"
-                    exit 1
-                fi
-                evasion_flags="$evasion_flags --mtu $2"
-                shift 2
-            else
-                echo -e "${RED}[!] Error: --mtu requires a numeric value.${NC}"
-                exit 1
-            fi
-            ;;
-        --decoy)
-            if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
-                evasion_flags="$evasion_flags -D RND:$2"
-                shift 2
-            else
-                echo -e "${RED}[!] Error: --decoy requires a numeric value (number of decoys).${NC}"
-                exit 1
-            fi
-            ;;
-        --source-port)
-            if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
-                source_port_flag="--source-port $2"
-                shift 2
-            else
-                echo -e "${RED}[!] Error: --source-port requires a numeric port value.${NC}"
-                exit 1
-            fi
-            ;;
-        --dns-server)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                dns_server_flag="--dns-server $2"
-                shift 2
-            else
-                echo -e "${RED}[!] Error: --dns-server requires an IP address.${NC}"
-                exit 1
-            fi
-            ;;
-        # ── NSE Scripts ─────────────────────────────────────────
-        --script)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                nse_scripts="--script $2"
-                shift 2
-            else
-                echo -e "${RED}[!] Error: --script requires a script name or comma-separated list.${NC}"
-                exit 1
-            fi
-            ;;
-        --script-cat)
-            if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
-                nse_scripts="--script $2"
-                shift 2
-            else
-                echo -e "${RED}[!] Error: --script-cat requires a category name.${NC}"
-                exit 1
-            fi
-            ;;
-        *)
-            if [ -z "$target_ip" ]; then
-                target_ip="$1"
-                shift
-            else
-                echo -e "${RED}[!] Unknown or misplaced argument: $1${NC}"
-                shift
-            fi
-            ;;
-    esac
-done
+def safe_name(s):
+    """Sanitize string for use as filename."""
+    return re.sub(r'[^\w\-.]', '_', s).strip('_') or "host"
 
-# --- 3. IP and Name Verification ---
-if [ -z "$target_ip" ]; then
-    echo -e "${RED}[!] Error: No IP address provided.${NC}"
-    show_help
-    exit 1
-fi
+# ── Active process registry (for SPACE status on demand) ─────────────────────
 
-echo -e -n "${YELLOW}Enter a base name for the files (e.g., 'WebServer'): ${NC}"
-read base_name
+_active_procs      = {}   # label → (Popen, start_timestamp)
+_active_procs_lock = threading.Lock()
 
-if [ -z "$base_name" ]; then
-    echo -e "${RED}[!] Error: You must provide a base name.${NC}"
-    exit 1
-fi
+def _register_proc(label, proc):
+    with _active_procs_lock:
+        _active_procs[label] = {'proc': proc, 'started': datetime.now(), 'pct': None}
 
-file_ports="ports_${base_name}.nmap"
-file_info="info_${base_name}.nmap"
-file_udp="UDP_${base_name}.nmap"
+def _unregister_proc(label):
+    with _active_procs_lock:
+        _active_procs.pop(label, None)
 
-# NEW: XML/HTML file names
-file_ports_xml="ports_${base_name}.xml"
-file_info_xml="info_${base_name}.xml"
-file_ports_html="ports_${base_name}.html"
-file_info_html="info_${base_name}.html"
+_watcher_stop = threading.Event()
 
-# NEW: build output flag string (adds -oX alongside -oN when --html is set)
-build_output_flags() {
-    local base_file="$1"
-    local xml_file="$2"
-    if [[ $html_output -eq 1 ]]; then
-        echo "-oN ${base_file} -oX ${xml_file}"
-    else
-        echo "-oN ${base_file}"
-    fi
-}
+def _fmt_elapsed(start):
+    """Format elapsed time since start as 'Xm Ys'."""
+    secs = int((datetime.now() - start).total_seconds())
+    if secs < 60:
+        return f"{secs}s"
+    return f"{secs // 60}m {secs % 60:02d}s"
 
-# NEW: convert XML to HTML using xsltproc
-convert_to_html() {
-    local xml_file="$1"
-    local html_file="$2"
-    if [[ -f "$xml_file" ]]; then
-        echo -e "${CYAN}[*] Converting $xml_file → $html_file ...${NC}"
-        if xsltproc "$xml_file" -o "$html_file" 2>/dev/null; then
-            echo -e "${GREEN}[✔] HTML report: $(pwd)/${html_file}${NC}"
-        else
-            echo -e "${RED}[!] xsltproc failed. Is it installed? (apt install xsltproc)${NC}"
-        fi
-    fi
-}
+def _spacebar_watcher():
+    """
+    Background thread: reads single keypresses without breaking output.
+    SPACE  → prints status of all active nmap scans (IP, phase, elapsed time).
 
-echo -e "------------------------------------------------"
-echo -e "${YELLOW}[*] Starting scan for: $target_ip${NC}"
-echo -e "${YELLOW}[*] Timing Template: $timing_arg $phase1_rate_flag${NC}"
-echo -e "${YELLOW}[*] Files will be saved as: *_${base_name}.nmap${NC}"
+    We manually set only ICANON and ECHO off in LFLAG so that:
+      - We can read single characters without waiting for Enter
+      - Normal output processing (\n → \r\n via OPOST/ONLCR) is preserved
+    """
+    if not sys.stdin.isatty():
+        return
+    fd  = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        # Manual cbreak: only touch LFLAG, leave IFLAG/OFLAG/CFLAG alone
+        new = termios.tcgetattr(fd)
+        new[3] = new[3] & ~(termios.ICANON | termios.ECHO)  # LFLAG
+        new[6][termios.VMIN]  = 0   # non-blocking read
+        new[6][termios.VTIME] = 2   # 0.2s timeout
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
 
-# NEW: print active evasion/extra options
-[[ -n "$evasion_flags" ]]   && echo -e "${MAGENTA}[*] Evasion flags: $evasion_flags${NC}"
-[[ -n "$source_port_flag" ]] && echo -e "${MAGENTA}[*] Source port: $source_port_flag${NC}"
-[[ -n "$dns_server_flag" ]]  && echo -e "${MAGENTA}[*] DNS server: $dns_server_flag${NC}"
-[[ -n "$nse_scripts" ]]      && echo -e "${CYAN}[*] NSE scripts: $nse_scripts${NC}"
-[[ $ack_scan -eq 1 ]]        && echo -e "${MAGENTA}[*] ACK scan mode enabled (-sA)${NC}"
-[[ $html_output -eq 1 ]]     && echo -e "${CYAN}[*] HTML output enabled${NC}"
-echo -e "------------------------------------------------"
+        while not _watcher_stop.is_set():
+            ch = os.read(fd, 1)
+            if not ch:
+                continue
+            ch = ch.decode('utf-8', errors='ignore')
+            if ch == ' ':
+                with _active_procs_lock:
+                    entries = list(_active_procs.items())
+                if entries:
+                    print(f"\n{Y}━━━ [SPACE] Active scans ({len(entries)}) ━━━{NC}",
+                          flush=True)
+                    for lbl, entry in entries:
+                        elapsed = _fmt_elapsed(entry['started'])
+                        pct     = entry.get('pct')
+                        pct_str = f" {G}{pct}%{NC}" if pct is not None else ""
+                        print(f"{C}  → {lbl}{NC}{pct_str}  {DIM}[{elapsed}]{NC}",
+                              flush=True)
+                    print(f"{Y}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{NC}",
+                          flush=True)
+                else:
+                    print(f"\n{DIM}[SPACE] No active nmap scans right now.{NC}",
+                          flush=True)
+            elif ch in ('\x03', '\x04'):  # Ctrl-C / Ctrl-D
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
 
-# --- 4. PHASE 1: FAST PORT SCAN (TCP) ---
-echo -e "${YELLOW}[*] PHASE 1 (TCP): Starting fast port scan...${NC}"
+def start_spacebar_watcher():
+    """Launch the spacebar watcher thread and show the usage hint."""
+    p(DIM, "[hint] Press SPACE at any time to request nmap status.")
+    t = threading.Thread(target=_spacebar_watcher, daemon=True)
+    t.start()
+    return t
 
-# NEW: choose scan type (-sS default, -sA if --ack)
-phase1_scan_type="-sS"
-[[ $ack_scan -eq 1 ]] && phase1_scan_type="-sA"
+def stop_spacebar_watcher():
+    _watcher_stop.set()
 
-phase1_out=$(build_output_flags "$file_ports" "$file_ports_xml")
+def build_out(base, xml, html_on):
+    flags = ["-oN", base]
+    if html_on:
+        flags += ["-oX", xml]
+    return flags
 
-nmap $phase1_scan_type -Pn -p- $timing_arg $phase1_rate_flag \
-     $evasion_flags $source_port_flag $dns_server_flag \
-     $target_ip $phase1_out 2>/dev/null
+def to_html(xml, html):
+    """Convert XML to HTML silently, then delete the XML."""
+    if os.path.exists(xml):
+        r = subprocess.run(["xsltproc", xml, "-o", html], capture_output=True)
+        if r.returncode == 0:
+            try:
+                os.remove(xml)
+            except OSError:
+                pass
+        else:
+            p(R, "[!] xsltproc failed. (apt install xsltproc)")
 
-echo -e "${GREEN}[+] PHASE 1 (TCP): Complete. Output saved to $file_ports${NC}"
+def parse_open_ports(nmap_file):
+    """Return list of port numbers (str) that are open in a .nmap file."""
+    ports = []
+    if not os.path.exists(nmap_file):
+        return ports
+    with open(nmap_file) as f:
+        for line in f:
+            if re.match(r'^\d+/(tcp|udp)\s+open', line):
+                ports.append(line.split('/')[0].strip())
+    return ports
 
-# NEW: convert Phase 1 to HTML
-[[ $html_output -eq 1 ]] && convert_to_html "$file_ports_xml" "$file_ports_html"
+def parse_hostname(nmap_output, ip):
+    """Extract resolved hostname from nmap output, or None."""
+    for line in nmap_output.splitlines():
+        if "Nmap scan report for" in line:
+            rest = line.split("Nmap scan report for", 1)[1].strip()
+            m = re.match(r'^(.+?)\s+\([\d.]+\)$', rest)
+            if m:
+                return m.group(1).strip()
+    return None
 
-# --- 5. PHASE 2: EXHAUSTIVE SCAN (TCP) ---
-echo -e "${YELLOW}[*] Processing open ports for Phase 2...${NC}"
-ports=$(grep '^[0-9].*/tcp *open' $file_ports | cut -d'/' -f1 | tr '\n' ',' | sed 's/,$//')
+def resolve_base(ip, args):
+    """
+    Auto-resolve a base filename label for an IP.
+    Does a quick nmap -sn probe to get the hostname; falls back to the IP.
+    Returns a filesystem-safe string.
+    """
+    cmd = ["nmap", "-sn", "-PR" if not args.no_l2 else "-PE", ip]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout
+        hn = parse_hostname(out, ip)
+        if hn:
+            return safe_name(hn)
+    except Exception:
+        pass
+    return ip.replace('.', '-')
 
-if [ -z "$ports" ]; then
-    echo -e "${RED}[!] PHASE 2 (TCP): No open TCP ports found. Skipping...${NC}"
-else
-    echo -e "${YELLOW}[*] PHASE 2 (TCP): Starting exhaustive scan on ports: $ports${NC}"
+def parse_os(nmap_output):
+    """Extract OS info from nmap output."""
+    for line in nmap_output.splitlines():
+        for tag in ("OS details:", "Aggressive OS guesses:", "Running:"):
+            if tag in line:
+                return line.split(tag, 1)[1].strip()
+    return "(not detected)"
 
-    phase2_out=$(build_output_flags "$file_info" "$file_info_xml")
+_PCT_RE = re.compile(r'About\s+([\d.]+)%\s+done')
 
-    nmap -Pn -p $ports $timing_arg -sV -sS -sC \
-         $nse_scripts $source_port_flag $dns_server_flag \
-         $target_ip $phase2_out
+def run(cmd, label=None, silent=False):
+    """
+    Run a command and return captured stdout.
+    - label:  if set, registers the Popen in _active_procs for SPACE status.
+    - silent: if True, suppresses terminal output; parses nmap progress % instead.
+    """
+    # In silent mode add --stats-every so we can track progress internally
+    if silent and label:
+        cmd = list(cmd) + ["--stats-every", "3s"]
 
-    echo -e "${GREEN}[+] PHASE 2 (TCP): Complete. Output saved to $file_info${NC}"
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    if label:
+        _register_proc(label, proc)
+    out = []
+    for line in proc.stdout:
+        if silent:
+            # Parse nmap percentage lines, update registry silently
+            m = _PCT_RE.search(line)
+            if m and label:
+                with _active_procs_lock:
+                    if label in _active_procs:
+                        _active_procs[label]['pct'] = m.group(1).rstrip('0').rstrip('.')
+        else:
+            print(line, end="", flush=True)
+        out.append(line)
+    proc.wait()
+    if label:
+        _unregister_proc(label)
+    return "".join(out)
 
-    # NEW: convert Phase 2 to HTML
-    [[ $html_output -eq 1 ]] && convert_to_html "$file_info_xml" "$file_info_html"
-fi
+# ── Per-host scan ─────────────────────────────────────────────────────────────
 
-# --- 6. PHASE 3: UDP SCAN (OPTIONAL) ---
-echo -e "------------------------------------------------"
-file_udp_xml="UDP_${base_name}.xml"
-file_udp_html="UDP_${base_name}.html"
-udp_log="UDP_${base_name}.log"
-udp_pid=""
+def scan_host(ip, base, args, scan_dir=None):
+    """
+    Full 2-phase TCP scan (+ optional UDP) for a single host.
+    Files are placed in scan_dir if given, else current directory.
+    Returns dict with: hostname, os_info, open_ports (list of raw lines).
+    """
+    def path(name):
+        return os.path.join(scan_dir, name) if scan_dir else name
 
-# Helper: run UDP nmap command, in bg or fg depending on $udp_bg
-run_udp_scan() {
-    local nmap_cmd="$1"
-    if [[ $udp_bg -eq 1 ]]; then
-        echo -e "${CYAN}[*] PHASE 3 (UDP): Running in BACKGROUND...${NC}"
-        echo -e "${CYAN}[*] Log file: ${udp_log}${NC}"
-        eval "$nmap_cmd" > "$udp_log" 2>&1 &
-        udp_pid=$!
-        echo -e "${GREEN}[+] PHASE 3 (UDP): Launched in background (PID: ${udp_pid}).${NC}"
-        echo -e "${YELLOW}    Monitor with: tail -f ${udp_log}${NC}"
-        echo -e "${YELLOW}    Wait manually: wait ${udp_pid}${NC}"
-    else
-        eval "$nmap_cmd"
-        echo -e "${GREEN}[+] PHASE 3 (UDP): Complete. Output saved to $file_udp${NC}"
-        [[ $html_output -eq 1 ]] && convert_to_html "$file_udp_xml" "$file_udp_html"
-    fi
-}
+    fp      = path(f"ports_{base}.nmap")
+    fp_xml  = path(f"ports_{base}.xml")
+    fi      = path(f"info_{base}.nmap")
+    fi_xml  = path(f"info_{base}.xml")
+    fu      = path(f"UDP_{base}.nmap")
+    fu_xml  = path(f"UDP_{base}.xml")
 
-case "$udp_option" in
-    --udp-top)
-        echo -e "${YELLOW}[*] PHASE 3 (UDP): Starting UDP scan on Top 100 ports...${NC}"
-        echo -e "${YELLOW}[!] (Sudo required)${NC}"
-        udp_out=$(build_output_flags "$file_udp" "$file_udp_xml")
-        run_udp_scan "sudo nmap -Pn $timing_arg -sU --top-ports 100 \
-             $source_port_flag $dns_server_flag \
-             $target_ip $udp_out"
-        ;;
-    --udp-full)
-        echo -e "${YELLOW}[*] PHASE 3 (UDP): Starting FULL UDP scan (-p-)...${NC}"
-        echo -e "${RED}[!] (This can take a VERY long time. Sudo required)${NC}"
-        udp_out=$(build_output_flags "$file_udp" "$file_udp_xml")
-        run_udp_scan "sudo nmap -Pn $timing_arg -sU -p- \
-             $source_port_flag $dns_server_flag \
-             $target_ip $udp_out"
-        ;;
-    *)
-        echo -e "${YELLOW}[*] PHASE 3 (UDP): Skipping UDP scan.${NC}"
-        ;;
-esac
+    silent   = getattr(args, '_silent', False)
+    host_tag = f"{ip} ({base})"   # for SPACE status display
 
-echo -e "------------------------------------------------"
-echo -e "${GREEN}[✔] TCP scans have finished.${NC}"
+    if not silent:
+        print("=" * 48, flush=True)
+        p(Y, f"[*] Target: {C}{ip}")
+        p(Y, f"[*] Base name: {base}")
+        p(Y, f"[*] Timing: {args.timing_arg} {args.rate_flag}")
+        if args.no_l2:  p(M, "[*] No OSI Layer 2 → TCP connect scan (-sT)")
+        if args.ack:    p(M, "[*] ACK scan mode (-sA)")
+        if args.evasion: p(M, f"[*] Evasion: {' '.join(args.evasion)}")
+        if args.source_port: p(M, f"[*] Source port: {args.source_port}")
+        if args.dns_server:  p(M, f"[*] DNS server: {args.dns_server}")
+        if args.nse:    p(C, f"[*] NSE: {' '.join(args.nse)}")
+        if args.html:   p(C, "[*] HTML output enabled")
+        print("-" * 48, flush=True)
 
-# Wait for background UDP scan if it was launched
-if [[ -n "$udp_pid" ]]; then
-    echo -e "\n${CYAN}[*] Background UDP scan still running (PID: ${udp_pid}).${NC}"
-    echo -e -n "${YELLOW}    Wait for it to finish before exiting? [Y/n]: ${NC}"
-    read -r wait_resp
-    wait_resp="${wait_resp:-Y}"
-    if [[ "$wait_resp" =~ ^[Yy]$ ]]; then
-        echo -e "${CYAN}[*] Waiting for UDP scan (PID: ${udp_pid})...${NC}"
-        wait "$udp_pid"
-        echo -e "${GREEN}[+] PHASE 3 (UDP): Complete. Output saved to $file_udp${NC}"
-        [[ $html_output -eq 1 ]] && convert_to_html "$file_udp_xml" "$file_udp_html"
-    else
-        echo -e "${YELLOW}[*] Leaving UDP scan running in background. PID: ${udp_pid}${NC}"
-        echo -e "${YELLOW}    Monitor: tail -f ${udp_log}${NC}"
-    fi
-fi
+    # ── Phase 1: fast full-port TCP scan ──────────────────────────
+    if not silent:
+        p(Y, f"[*] [{ip}] PHASE 1 (TCP): fast full-port scan ...")
+    scan1 = "-sT" if args.no_l2 else ("-sA" if args.ack else "-sS")
+    cmd1  = ["nmap", scan1, "-Pn", "-p-", args.timing_arg]
+    if args.rate_flag: cmd1 += args.rate_flag.split()
+    cmd1 += args.evasion
+    if args.source_port: cmd1 += ["--source-port", str(args.source_port)]
+    if args.dns_server:  cmd1 += ["--dns-server", args.dns_server]
+    cmd1 += [ip] + build_out(fp, fp_xml, args.html)
 
-# NEW: summary of HTML reports & optional HTTP server
-if [[ $html_output -eq 1 ]]; then
-    echo -e "\n${CYAN}[*] HTML reports generated:${NC}"
-    for f in ports_${base_name}.html info_${base_name}.html UDP_${base_name}.html; do
-        [[ -f "$f" ]] && echo -e "    ${GREEN}→ $(pwd)/$f${NC}"
-    done
+    out1 = run(cmd1, label=f"{host_tag} — Phase 1: port discovery", silent=silent)
+    if not silent:
+        p(G, f"[+] [{ip}] Phase 1 done → {fp}")
+    if args.html: to_html(fp_xml, path(f"ports_{base}.html"))
 
-    if [[ $serve_http -eq 1 ]]; then
-        echo -e "\n${CYAN}[*] Starting HTTP server on port ${serve_port}...${NC}"
-        echo -e "${YELLOW}    Open in your browser: http://127.0.0.1:${serve_port}/${NC}"
-        echo -e "${YELLOW}    e.g. http://127.0.0.1:${serve_port}/info_${base_name}.html${NC}"
-        echo -e "\033[2m    (Ctrl+C to stop the server)\033[0m"
-        python3 -m http.server "$serve_port"
-    fi
-fi
+    hostname = parse_hostname(out1, ip)
+
+    # ── Phase 2: exhaustive scan on open ports ─────────────────
+    if not silent:
+        p(Y, f"[*] [{ip}] Processing open ports ...")
+    ports = parse_open_ports(fp)
+    os_info = "(not detected)"
+
+    if not ports:
+        if not silent:
+            p(R, f"[!] [{ip}] No open TCP ports found. Skipping phase 2.")
+    else:
+        port_str = ",".join(ports)
+        if not silent:
+            p(Y, f"[*] [{ip}] Phase 2: {port_str}")
+        scan2 = "-sT" if args.no_l2 else "-sS"
+        cmd2  = ["nmap", "-Pn", "-p", port_str, args.timing_arg,
+                 "-sV", scan2, "-sC", "-O"]
+        cmd2 += args.nse
+        if args.source_port: cmd2 += ["--source-port", str(args.source_port)]
+        if args.dns_server:  cmd2 += ["--dns-server", args.dns_server]
+        cmd2 += [ip] + build_out(fi, fi_xml, args.html)
+
+        out2 = run(cmd2, label=f"{host_tag} — Phase 2: exhaustive ({port_str})", silent=silent)
+        os_info = parse_os(out2)
+        if not silent:
+            p(G, f"[+] [{ip}] Phase 2 done → {fi}")
+        if args.html: to_html(fi_xml, path(f"info_{base}.html"))
+
+    # ── Phase 3: UDP (optional) ────────────────────────────────────
+    udp_proc = None
+    if args.udp_top or args.udp_full:
+        udp_ports = ["--top-ports", "100"] if args.udp_top else ["-p-"]
+        udp_label = "Top-100" if args.udp_top else "full"
+        if not silent:
+            p(Y, f"[*] [{ip}] PHASE 3 (UDP): {udp_label} scan ...")
+            p(Y, "[!] (sudo required)")
+        cmd_u = ["sudo", "nmap", "-Pn", args.timing_arg, "-sU"] + udp_ports
+        if args.source_port: cmd_u += ["--source-port", str(args.source_port)]
+        if args.dns_server:  cmd_u += ["--dns-server", args.dns_server]
+        cmd_u += [ip] + build_out(fu, fu_xml, args.html)
+        if args.udp_bg:
+            log = path(f"UDP_{base}.log")
+            p(C, f"[*] UDP running in background → log: {log}")
+            with open(log, 'w') as lf:
+                udp_proc = subprocess.Popen(cmd_u, stdout=lf, stderr=subprocess.STDOUT,
+                                            stdin=subprocess.DEVNULL)
+            if not silent:
+                p(G, f"[+] UDP launched (PID {udp_proc.pid})")
+        else:
+            run(cmd_u, label=f"{host_tag} — Phase 3: UDP ({udp_label})", silent=silent)
+            if not silent:
+                p(G, f"[+] [{ip}] Phase 3 done → {fu}")
+            if args.html: to_html(fu_xml, path(f"UDP_{base}.html"))
+    else:
+        if not silent:
+            p(Y, f"[*] [{ip}] Phase 3 (UDP): skipped.")
+
+    if not silent:
+        print("-" * 48, flush=True)
+        p(G, f"[✔] [{ip}] All scans finished.")
+        print("-" * 48, flush=True)
+
+    # Collect open port lines for summary
+    open_lines = []
+    if os.path.exists(fp):
+        with open(fp) as f:
+            for line in f:
+                if re.match(r'^\d+/(tcp|udp)\s+open', line):
+                    open_lines.append(line.rstrip())
+
+    return {
+        "ip":         ip,
+        "hostname":   hostname,
+        "os":         os_info,
+        "open_lines": open_lines,
+        "udp_proc":   udp_proc,
+        "base":       base,
+    }
+
+# ── Network range scan ────────────────────────────────────────────────────────
+
+def do_net_scan(cidr, args):
+    safe_cidr    = cidr.replace('/', '-')
+    scan_dir     = f"netscan_{safe_cidr}"
+    summary_file = f"netscan_summary_{safe_cidr}.txt"
+
+    print("=" * 48, flush=True)
+    p(C, f"[*] NETWORK SCAN: {Y}{cidr}")
+    p(M, "[*] No OSI Layer 2 → ICMP/TCP ping (no ARP)" if args.no_l2
+        else "[*] Layer 2 available → ARP ping")
+    p(Y, f"[*] Timing: {args.timing_arg} {args.rate_flag}")
+    p(C, f"[*] Output directory: {scan_dir}/")
+    p(C, f"[*] Global summary:   {summary_file}")
+    print("=" * 48, flush=True)
+
+    os.makedirs(scan_dir, exist_ok=True)
+
+    # ── Host discovery ────────────────────────────────────────────
+    p(Y, f"[*] Phase 1/3: Discovering hosts in {cidr} ...")
+    if args.no_l2:
+        disc_flags = ["-PE", "-PS80,443", "-PA80", "--disable-arp-ping"]
+    else:
+        disc_flags = ["-PR"]
+
+    cmd_disc = ["nmap", "-sn"] + disc_flags + [args.timing_arg]
+    if args.rate_flag: cmd_disc += args.rate_flag.split()
+    if args.dns_server: cmd_disc += ["--dns-server", args.dns_server]
+    cmd_disc.append(cidr)
+
+    disc_out = subprocess.run(cmd_disc, capture_output=True, text=True).stdout
+
+    live = []
+    for line in disc_out.splitlines():
+        if "Nmap scan report for" in line:
+            rest = line.split("Nmap scan report for", 1)[1].strip()
+            m = re.match(r'^(.+?)\s+\(([\d.]+)\)$', rest)
+            if m:
+                live.append((m.group(2).strip(), m.group(1).strip()))
+            else:
+                live.append((rest.strip(), None))
+
+    if not live:
+        p(R, f"[!] No active hosts found in {cidr}.")
+        return
+
+    disc_method = "ICMP/TCP ping (no ARP)" if args.no_l2 else "ARP ping (-PR)"
+    p(G, f"[+] Active hosts: {len(live)}  [{disc_method}]")
+    for ip, hn in live:
+        p(C, f"    → {hn + ' (' + ip + ')' if hn else ip}")
+    print("-" * 48, flush=True)
+
+    # Determine worker count
+    total = len(live)
+    raw_p = getattr(args, 'parallel', 1)
+    if str(raw_p).lower() == 'all':
+        workers = total
+    else:
+        workers = min(int(raw_p), total)
+    workers = max(1, workers)
+
+    parallel_label = "all" if workers == total else str(workers)
+    p(C, f"[*] Parallel workers: {parallel_label} (scanning {workers}/{total} hosts simultaneously)")
+    print("-" * 48, flush=True)
+
+    # Write summary header
+    with open(summary_file, 'w') as sf:
+        sf.write("=" * 64 + "\n")
+        sf.write(f"  NETWORK SCAN SUMMARY: {cidr}\n")
+        sf.write(f"  Date: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        sf.write(f"  L2 Mode: {'DISABLED (--no-l2)' if args.no_l2 else 'ENABLED'}\n")
+        sf.write(f"  Parallel workers: {parallel_label}\n")
+        sf.write("=" * 64 + "\n\n")
+
+    summary_lock = threading.Lock()
+
+    # ── Per-host full scan ────────────────────────────────────────
+    # In net-scan mode always silent: user presses SPACE to check progress
+    args._silent = True
+
+    watcher = start_spacebar_watcher()
+
+    p(Y, f"[*] Phase 2/3: Fast port scan → Phase 3/3: Exhaustive scan (workers={parallel_label}) ...")
+    print("=" * 48, flush=True)
+
+    completed = []   # collect (ip, hostname) as hosts finish
+
+    def scan_one(idx_ip_hn):
+        idx, ip, hn = idx_ip_hn
+        base   = safe_name(hn) if hn else ip.replace('.', '-')
+        result = scan_host(ip, base, args, scan_dir=scan_dir)
+        final_hn = result["hostname"] or hn or "(unresolved)"
+        return (ip, final_hn, result)
+
+    tasks = [(i + 1, ip, hn) for i, (ip, hn) in enumerate(live)]
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(scan_one, t): t for t in tasks}
+        for future in as_completed(futures):
+            ip, final_hn, result = future.result()
+            completed.append((ip, final_hn, result))
+            # Thread-safe summary write
+            with summary_lock:
+                with open(summary_file, 'a') as sf:
+                    sf.write("-" * 64 + "\n")
+                    sf.write(f"  HOST: {ip}\n")
+                    sf.write(f"  Name: {final_hn}\n")
+                    sf.write(f"  OS:   {result['os']}\n")
+                    sf.write("  Open ports:\n")
+                    if result["open_lines"]:
+                        for line in result["open_lines"]:
+                            sf.write(f"    {line}\n")
+                    else:
+                        sf.write("    (none found)\n")
+                    sf.write("\n")
+
+    stop_spacebar_watcher()
+
+    # Finalize summary file
+    with open(summary_file, 'a') as sf:
+        sf.write("=" * 64 + "\n")
+        sf.write(f"  Total hosts scanned: {total}\n")
+        sf.write(f"  Files in: {os.path.abspath(scan_dir)}/\n")
+        sf.write("=" * 64 + "\n")
+
+    print(flush=True)
+    print("=" * 48, flush=True)
+    p(G, f"[✔] Network scan completed ({len(completed)}/{total} hosts).")
+    for c_ip, c_hn, c_res in completed:
+        ports_count = len(c_res["open_lines"])
+        p(C, f"    → {c_hn} ({c_ip})  {DIM}[{ports_count} open port{'s' if ports_count != 1 else ''}]{NC}")
+    print("-" * 48, flush=True)
+    p(G, f"[✔] Summary: {os.path.abspath(summary_file)}")
+    p(G, f"[✔] Files:   {os.path.abspath(scan_dir)}/")
+    print("=" * 48, flush=True)
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+def show_help():
+    prog = sys.argv[0]
+    print(f"{G}Usage:{NC} {prog} <ip1> [ip2 ...] [options]")
+    print(f"\n{Y}Description:{NC}")
+    print("  Runs a 2 or 3-phased Nmap scan against one or more targets.")
+    print("  Multiple targets are scanned in parallel.")
+    print(f"\n{Y}Options:{NC}")
+    print("  -h, --help              Show this help message.")
+    print("  --timing <0-5>          Timing template (default: T4 + --min-rate 1000).")
+    print(f"\n{C}  --- UDP ---{NC}")
+    print("  --udp-top               UDP scan on Top 100 ports (after TCP).")
+    print("  --udp-full              Full UDP scan (after TCP).")
+    print("  --udp-bg                Run UDP in background.")
+    print(f"\n{C}  --- Output ---{NC}")
+    print("  --html                  Save XML output and convert to HTML (needs xsltproc).")
+    print("                          XML files are deleted after conversion.")
+    print(f"\n{C}  --- Evasion ---{NC}")
+    print("  --no-l2                 No OSI Layer 2 (no ARP). Uses -sT instead of -sS.")
+    print("  --ack                   ACK scan (-sA) in Phase 1.")
+    print("  --frag                  Fragment packets 8 bytes (-f).")
+    print("  --frag-double           Fragment packets 16 bytes (-ff).")
+    print("  --mtu <N>               Custom MTU (multiple of 8).")
+    print("  --decoy <N>             N random decoy IPs (-D RND:N).")
+    print("  --source-port <N>       Spoof source port.")
+    print("  --dns-server <IP>       Custom DNS server.")
+    print(f"\n{C}  --- NSE Scripts ---{NC}")
+    print("  --script <name,...>     Run specific NSE script(s) in Phase 2.")
+    print("  --script-cat <cat>      Run all NSE scripts from a category.")
+    print(f"\n{C}  --- Network Range Scan ---{NC}")
+    print("  --name <LABEL>          Override base filename label (single target only).")
+    print(f"\n{C}  --- Network Range ---{NC}")
+    print("  --net-scan <CIDR>       Discover and fully scan a network range.")
+    print("                          Creates per-host files (named by hostname)")
+    print("                          and a global summary with OS, name and ports.")
+    print("  --parallel <N|all>      Hosts to scan simultaneously (required with --net-scan).")
+    print("                          N = number of concurrent scans, 'all' = all at once.")
+    print(f"\n{Y}Examples:{NC}")
+    print(f"  {prog} 10.10.11.100 --udp-top")
+    print(f"  {prog} 10.10.11.100 10.10.11.101 --timing 2")
+    print(f"  {prog} 10.10.11.100 --no-l2 --frag --decoy 5 --source-port 53")
+    print(f"  {prog} 10.10.11.100 --script-cat vuln")
+    print(f"  {prog} --net-scan 192.168.1.0/24")
+    print(f"  {prog} --net-scan 192.168.1.0/24 --parallel 5")
+    print(f"  {prog} --net-scan 10.10.10.0/24 --no-l2 --timing 3 --parallel all")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("targets", nargs="*")
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("--net-scan",   dest="net_scan")
+    parser.add_argument("--parallel",   dest="parallel", default=None,
+                        metavar="N|all",
+                        help="Hosts to scan simultaneously (required with --net-scan).")
+    parser.add_argument("--timing", type=int)
+    parser.add_argument("--udp-top",    action="store_true", dest="udp_top")
+    parser.add_argument("--udp-full",   action="store_true", dest="udp_full")
+    parser.add_argument("--udp-bg",     action="store_true", dest="udp_bg")
+    parser.add_argument("--html",       action="store_true")
+    parser.add_argument("--no-l2",      action="store_true", dest="no_l2")
+    parser.add_argument("--ack",        action="store_true")
+    parser.add_argument("--frag",       action="store_true")
+    parser.add_argument("--frag-double",action="store_true", dest="frag_double")
+    parser.add_argument("--mtu",        type=int)
+    parser.add_argument("--decoy",      type=int)
+    parser.add_argument("--source-port",type=int, dest="source_port")
+    parser.add_argument("--dns-server", dest="dns_server")
+    parser.add_argument("--script")
+    parser.add_argument("--script-cat",  dest="script_cat")
+    parser.add_argument("--name",         dest="name", default=None,
+                        metavar="LABEL",
+                        help="Override the base filename label (single target only).")
+
+    args = parser.parse_args()
+
+    if args.help or (not args.targets and not args.net_scan):
+        show_help()
+        sys.exit(0)
+
+    # Validation
+    if args.no_l2 and args.ack:
+        p(R, "[!] Error: --no-l2 and --ack are mutually exclusive.")
+        sys.exit(1)
+    if args.mtu and args.mtu % 8 != 0:
+        p(R, "[!] Error: --mtu must be a multiple of 8.")
+        sys.exit(1)
+    if args.udp_top and args.udp_full:
+        p(R, "[!] Error: --udp-top and --udp-full are mutually exclusive.")
+        sys.exit(1)
+    if args.script and args.script_cat:
+        p(R, "[!] Error: --script and --script-cat are mutually exclusive.")
+        sys.exit(1)
+
+    # Validate --parallel (used by both --net-scan and multi-host)
+    if args.parallel is not None:
+        par = str(args.parallel).lower()
+        if par != 'all':
+            try:
+                val = int(par)
+                if val < 1:
+                    raise ValueError
+            except ValueError:
+                p(R, "[!] Error: --parallel must be a positive integer or 'all'.")
+                sys.exit(1)
+
+    if args.net_scan and args.parallel is None:
+        p(R, "[!] Error: You must specify --parallel <N|all> when using --net-scan.")
+        sys.exit(1)
+
+    # Derived fields
+    if args.timing is not None:
+        args.timing_arg = f"-T{args.timing}"
+        args.rate_flag  = ""
+    else:
+        args.timing_arg = "-T4"
+        args.rate_flag  = "--min-rate 1000"
+
+    args.evasion = []
+    if args.frag:        args.evasion.append("-f")
+    if args.frag_double: args.evasion.append("-ff")
+    if args.mtu:         args.evasion += ["--mtu", str(args.mtu)]
+    if args.decoy:       args.evasion += ["-D", f"RND:{args.decoy}"]
+
+    if args.no_l2 and args.evasion:
+        p(Y, "[!] Warning: --no-l2 uses -sT. Some evasion flags require raw sockets.")
+
+    args.nse = []
+    if args.script:     args.nse = ["--script", args.script]
+    elif args.script_cat: args.nse = ["--script", args.script_cat]
+
+
+    if args.name and len(getattr(args, 'targets', [])) != 1:
+        p(R, "[!] Error: --name can only be used with a single target.")
+        sys.exit(1)
+
+    return args
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+
+    # ── Network range scan ─────────────────────────────────────────
+    if args.net_scan:
+        do_net_scan(args.net_scan, args)
+        return
+
+    # ── Individual / multiple host scan ───────────────────────────────────────
+    targets = args.targets
+    total   = len(targets)
+
+    if total == 1:
+        # ── Single host: verbose mode ──────────────────────────────────────────
+        ip   = targets[0]
+        base = safe_name(args.name) if args.name else resolve_base(ip, args)
+        args._silent = False
+        result   = scan_host(ip, base, args)
+        udp_proc = result.get("udp_proc")
+        if udp_proc:
+            ans = input(f"\n{C}[*] Background UDP still running (PID {udp_proc.pid}).\n"
+                        f"{Y}    Wait for it? [Y/n]: {NC}").strip() or "Y"
+            if ans.upper() == "Y":
+                udp_proc.wait()
+                p(G, "[+] UDP scan finished.")
+    else:
+        # ── Multi-host: same silent format as --net-scan ───────────────────────
+        args._silent = True
+        print("=" * 48, flush=True)
+        p(C, f"[*] MULTI-HOST SCAN: {total} targets")
+        p(Y, f"[*] Timing: {args.timing_arg} {args.rate_flag}")
+        print("=" * 48, flush=True)
+
+        # Resolve worker count (default: all targets simultaneously)
+        raw_p = str(args.parallel).lower() if args.parallel is not None else 'all'
+        if raw_p == 'all':
+            workers = total
+        else:
+            workers = min(int(raw_p), total)
+        workers = max(1, workers)
+        parallel_label = "all" if workers == total else str(workers)
+
+        p(C, f"[*] Parallel workers: {parallel_label} (scanning {workers}/{total} simultaneously)")
+        print("-" * 48, flush=True)
+
+        watcher   = start_spacebar_watcher()
+        completed = []
+        comp_lock = threading.Lock()
+
+        p(Y, "[*] Phase 1/2: Fast port scan → Phase 2/2: Exhaustive scan ...")
+        print("=" * 48, flush=True)
+
+        def scan_one_multi(ip):
+            base     = resolve_base(ip, args)
+            result   = scan_host(ip, base, args)
+            final_hn = result.get("hostname") or base
+            with comp_lock:
+                completed.append((ip, final_hn, result))
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            executor.map(scan_one_multi, targets)
+
+        stop_spacebar_watcher()
+
+        print(flush=True)
+        print("=" * 48, flush=True)
+        p(G, f"[✔] Scan completed ({len(completed)}/{total} hosts).")
+        for c_ip, c_hn, c_res in completed:
+            ports_count = len(c_res["open_lines"])
+            p(C, f"    → {c_hn} ({c_ip})  {DIM}[{ports_count} open port{'s' if ports_count != 1 else ''}]{NC}")
+        print("=" * 48, flush=True)
+
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        stop_spacebar_watcher()
+        print(f"\n{R}[!] Interrupted. Cleaning up...{NC}", flush=True)
+        # Kill all active nmap child processes cleanly
+        with _active_procs_lock:
+            for entry in _active_procs.values():
+                try:
+                    entry['proc'].kill()
+                except Exception:
+                    pass
+        os._exit(1)
