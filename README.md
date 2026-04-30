@@ -1,149 +1,114 @@
-# supernmap
+# SuperNmap
 
-**supernmap** is a Bash script that automates and optimizes your Nmap scanning workflow.
+**SuperNmap** is an advanced, highly-concurrent wrapper for `nmap` designed to optimize and automate network enumeration. It performs intelligent, multi-phased scanning to get results as fast as possible while maintaining a clean, noise-free terminal interface.
 
-Instead of running a single slow scan, supernmap segments the process into **phases** to get detailed results in the most efficient way, with built-in evasion techniques, NSE script support, and automatic HTML report generation.
+## Key Features
 
----
-
-## 🚀 Features
-
-- **Efficient 3-phase workflow** — fast all-port discovery, then deep scan only on open ports, optional UDP.
-- **HTML reports** — generate visual reports via `xsltproc` and serve them instantly with Python's HTTP server.
-- **Firewall & IDS evasion** — ACK scan, packet fragmentation, custom MTU, decoys, source port spoofing.
-- **DNS evasion** — custom DNS server support for DMZ environments.
-- **NSE scripts** — run any script or full category (vuln, brute, discovery, etc.) in Phase 2.
-- **Background UDP** — run UDP scans in parallel while you keep working.
-- **Organized output** — color-coded terminal, clearly named files per phase.
+- **Multi-Phased Scanning**:
+  - **Phase 1**: Fast, full-port TCP discovery scan.
+  - **Phase 2**: Exhaustive version and script scanning (`-sV -sC -O`) targeted *only* at the open ports found in Phase 1.
+  - **Phase 3 (Optional)**: UDP scanning (Top 100 or Full) that can be run in the background.
+- **Concurrent Multi-Host & Network Scanning**: Scan multiple individual targets or entire CIDR ranges (with ARP or ICMP host discovery) simultaneously.
+- **Interactive Live Status (SPACE)**: Terminal noise is aggressively suppressed during parallel scans. Press the `SPACE` bar at any time to view a real-time, clean progress report (with % completion and elapsed time) of all active worker threads.
+- **Auto-Resolution & Naming**: Automatically attempts to resolve hostnames to keep output files cleanly named and organized.
+- **Evasion & Stealth**: Built-in support for packet fragmentation, custom MTUs, decoys, source port spoofing, and disabling Layer 2 ARP pings.
+- **HTML Reporting**: Automatically convert Nmap XML output to beautiful HTML reports using `xsltproc` (XML files are automatically cleaned up afterward).
 
 ---
 
-## 🔬 How It Works (3-Phase Scan)
-
-| Phase | What it does | Output file |
-|---|---|---|
-| **Phase 1** | Fast TCP scan across all 65,535 ports | `ports_<name>.nmap` |
-| **Phase 2** | Deep `-sV -sC` scan on discovered open ports only | `info_<name>.nmap` |
-| **Phase 3** | Optional UDP scan (top-100 or full) | `UDP_<name>.nmap` |
-
-When `--html` is used, each phase also generates a `.xml` + `.html` report.
-
----
-
-## 🛠 Installation
+## Usage
 
 ```bash
-chmod +x /path/to/supernmap
-
-# (Optional) make it available system-wide
-sudo ln -s /path/to/supernmap /usr/local/bin/supernmap
+python3 supernmap.py <ip1> [ip2 ...] [options]
 ```
 
-**Dependencies:** `nmap`, `xsltproc` (for HTML output), `python3` (for HTTP server).
+### Options
+
+**Core & Timing:**
+- `-h, --help` : Show help message.
+- `--timing <0-5>` : Timing template (default is `T4` + `--min-rate 1000`).
+
+**UDP Scanning:**
+- `--udp-top` : Perform a UDP scan on the Top 100 ports after the TCP scan completes.
+- `--udp-full` : Perform a full 65535-port UDP scan after TCP.
+- `--udp-bg` : Run the UDP scan in the background so you can continue working while it finishes.
+
+**Output:**
+- `--html` : Save XML output and automatically convert it to HTML. Temporary XML files are deleted after successful conversion.
+
+**Evasion & Stealth:**
+- `--no-l2` : Disable OSI Layer 2 (ARP) discovery. Falls back to `-sT` for scanning.
+- `--ack` : Perform an ACK scan (`-sA`) during Phase 1 instead of SYN.
+- `--frag` : Fragment packets to 8 bytes (`-f`).
+- `--frag-double` : Fragment packets to 16 bytes (`-ff`).
+- `--mtu <N>` : Specify a custom MTU (must be a multiple of 8).
+- `--decoy <N>` : Use `N` random decoy IPs (`-D RND:N`).
+- `--source-port <N>` : Spoof the source port for the scan.
+- `--dns-server <IP>` : Specify a custom DNS server.
+
+**NSE Scripts:**
+- `--script <name,...>` : Run specific Nmap Scripting Engine (NSE) script(s) during Phase 2.
+- `--script-cat <cat>` : Run all NSE scripts from a specific category (e.g., `vuln`, `safe`).
+
+**Naming & Multi-Host / Network Range:**
+- `--name <LABEL>` : Manually override the base filename label (only works when scanning a single target).
+- `--net-scan <CIDR>` : Discover active hosts in a network range and perform full 2-phase scans on all of them. Creates a dedicated output directory and a global summary file.
+- `--parallel <N|all>` : Specify the number of hosts to scan simultaneously. Required when using `--net-scan`. Set to `all` to scan every discovered host concurrently.
 
 ---
 
-## 🖥 Usage
+## Output Structure
 
-```
-supernmap <ip_address> [options]
-```
+SuperNmap automatically saves files for each phase. If auto-resolution finds the hostname `gateway` for `192.168.1.1`:
+- `ports_gateway.nmap` (Phase 1 fast scan results)
+- `info_gateway.nmap` (Phase 2 exhaustive scan results)
+- `UDP_gateway.nmap` (Optional Phase 3 results)
 
-The script will prompt you for a **base name** used to name all output files (e.g., `WebServer` → `ports_WebServer.nmap`).
-
----
-
-## ⚙ Options
-
-### General
-| Flag | Description |
-|---|---|
-| `-h, --help` | Show the help message. |
-| `--timing <0-5>` | Nmap timing template. Default: `-T4 --min-rate 1000`. Use lower values to evade IDS. |
-
-### UDP
-| Flag | Description |
-|---|---|
-| `--udp-top` | UDP scan on Top 100 ports (after TCP phases). |
-| `--udp-full` | Full UDP scan on all ports (after TCP phases). |
-| `--udp-bg` | Run the UDP scan in the **background** (parallel). Default is sequential. |
-
-### Output
-| Flag | Description |
-|---|---|
-| `--html` | Save scans as XML and auto-convert to HTML via `xsltproc`. |
-| `--serve [port]` | Start a `python3 -m http.server` to view HTML reports in the browser. Implies `--html`. Default port: `8080`. |
-
-### Evasion
-| Flag | Description |
-|---|---|
-| `--ack` | ACK scan (`-sA`) in Phase 1 — evades stateless firewalls. |
-| `--frag` | Fragment packets at 8 bytes (`-f`). |
-| `--frag-double` | Fragment packets at 16 bytes (`-ff`). |
-| `--mtu <N>` | Custom MTU (must be a multiple of 8). |
-| `--decoy <N>` | Add N random decoy IPs (`-D RND:N`) to disguise the origin. |
-| `--source-port <N>` | Spoof source port (e.g. `53` to pass through misconfigured firewalls). |
-| `--dns-server <IP>` | Use a custom DNS server — useful inside DMZ to resolve internal hostnames. |
-
-### NSE Scripts
-| Flag | Description |
-|---|---|
-| `--script <name,...>` | Run specific NSE script(s) in Phase 2 (comma-separated). |
-| `--script-cat <cat>` | Run all NSE scripts from a category in Phase 2. |
-
-**Available categories:** `auth`, `broadcast`, `brute`, `default`, `discovery`, `dos`, `exploit`, `external`, `fuzzer`, `intrusive`, `malware`, `safe`, `version`, `vuln`
+When using `--net-scan 192.168.1.0/24`:
+- Output is organized into a newly created `netscan_192.168.1.0-24/` directory.
+- A global summary file `netscan_summary_192.168.1.0-24.txt` is generated containing the active IPs, resolved hostnames, detected OS, and all open ports.
 
 ---
 
-## 💡 Examples
+## Interactive Live Status
 
+During parallel multi-host or `--net-scan` executions, standard Nmap output is silenced to prevent terminal formatting corruption.
+**Simply press the `SPACE` bar** to display an instantly-updated dashboard showing:
+- Which hosts are currently being scanned.
+- The active phase (e.g., Exhaustive scanning on specific open ports).
+- Real-time percentage completion.
+- Elapsed time for each active worker.
+
+---
+
+## Examples
+
+**1. Basic single host with Top 100 UDP:**
 ```bash
-# Standard TCP scan
-supernmap 10.10.11.100
-
-# TCP + Top-100 UDP, slow timing
-supernmap 10.10.11.100 --timing 2 --udp-top
-
-# Generate HTML report and serve it in the browser
-sudo supernmap 10.10.11.100 --html --serve 8080
-
-# Evasion: fragmentation + decoys + source port 53
-sudo supernmap 10.10.11.100 --frag --decoy 5 --source-port 53
-
-# Source port 53 TCP (bypass misconfigured firewall)
-sudo supernmap 10.10.11.100 --source-port 53 --html
-
-# DMZ: use internal DNS server to resolve internal hostnames
-sudo supernmap 10.10.11.100 --dns-server 10.10.10.1
-
-# Vulnerability scan (NSE category)
-sudo supernmap 10.10.11.100 --script-cat vuln --html
-
-# Specific NSE scripts
-sudo supernmap 10.10.11.100 --script http-title,ssl-cert
-
-# Full UDP in background while you work
-sudo supernmap 10.10.11.100 --udp-full --udp-bg
+python3 supernmap.py 10.10.11.100 --udp-top
 ```
 
----
+**2. Multi-host scan with slower timing:**
+```bash
+python3 supernmap.py 10.10.11.100 10.10.11.101 --timing 2
+```
 
-## 📄 Output Files
+**3. Stealthy evasion scan with a custom filename:**
+```bash
+python3 supernmap.py 10.10.11.100 --name TargetWeb --no-l2 --frag --decoy 5 --source-port 53
+```
 
-| File | Content |
-|---|---|
-| `ports_<name>.nmap` | Phase 1 raw output |
-| `info_<name>.nmap` | Phase 2 deep scan output |
-| `UDP_<name>.nmap` | Phase 3 UDP output |
-| `*.xml` | XML output (when `--html` is used) |
-| `*.html` | HTML report (when `--html` is used) |
-| `UDP_<name>.log` | UDP stdout log (when `--udp-bg` is used) |
+**4. Vulnerability scanning with HTML report generation(per host):**
+```bash
+python3 supernmap.py 10.10.11.100 --script-cat vuln --html
+```
 
----
+**5. Full subnet discovery and parallel scanning (5 hosts at a time):**
+```bash
+python3 supernmap.py --net-scan 192.168.1.0/24 --parallel 5
+```
 
-## ⚠ Notes on Evasion
-
-- **`--frag` / `--frag-double` / `--mtu`** are ineffective against **stateful firewalls** (modern `iptables` with connection tracking). They also break OS detection (`-O`).
-- **`--decoy`** requires the decoy IPs to be **alive**; dead decoys can trigger SYN-flood protections.
-- **`--source-port 53`** exploits misconfigured firewalls that blindly trust DNS traffic. Pair with `-Pn` to skip ICMP ping.
-- **`--dns-server`** is most powerful when used from a compromised host inside a DMZ.
+**6. Maximum concurrency subnet scan without ARP (useful over ligolo):**
+```bash
+python3 supernmap.py --net-scan 10.10.10.0/24 --no-l2 --parallel all
+```
